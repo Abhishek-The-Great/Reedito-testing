@@ -1,0 +1,78 @@
+services:
+  mysql:
+    # Smaller InnoDB buffer pool than the baseline compose.dev.yaml (1G).
+    # Lets the dev stack stay within a 2-core / 8 GB Codespace's budget
+    # after Reedito + the default Admin/Portal dev watchers are running.
+    # 256 MB is plenty for dev data volumes.
+    command: --innodb-buffer-pool-size=256M --innodb-log-buffer-size=64M --innodb-flush-log-at-trx_commit=0 --innodb-flush-method=O_DIRECT
+    # mem_limit is a hard cgroup ceiling, separate from the buffer pool size
+    # above. Measured via `docker stats` under real usage: actual RSS sits
+    # around 440-460MiB, so the previous 512m cap left MySQL pinned at
+    # 85-90% of its ceiling continuously (real, not just at boot) -- more
+    # memory-management overhead on every query than the buffer pool size
+    # alone would suggest. 1g (matching host-hybrid's unconstrained default)
+    # gives real headroom above the actual working set, still a small slice
+    # even on the 2-core/8GB minimum tier.
+    mem_limit: 1g
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped
+
+  mailpit:
+    restart: unless-stopped
+
+  reedito-dev:
+    # Mount the full repo so VS Code can edit apps/, e2e/, and root config files.
+    # The original ./reedito:/home/reedito/reedito mount from compose.dev.yaml is
+    # preserved via merge semantics so nodemon hot-reload still works for anyone
+    # running the backend the original way.
+    #
+    # pnpm-store is a separate named volume, NOT under /workspaces/Reedito, so
+    # it survives the bind mount above (which fully shadows anything baked
+    # into the image at that path with the host's — node_modules-less — repo
+    # checkout). Because the source is live-mounted, onCreateCommand still has
+    # to run a real `pnpm install` every time, but with the store already warm
+    # it's linking already-fetched content instead of
+    # re-downloading and recompiling native deps (better-sqlite3, sharp, etc.)
+    # from scratch.
+    volumes:
+      - ./:/workspaces/Reedito:cached
+      - pnpm-store:/pnpm-store
+    environment:
+      pnpm_config_store_dir: /pnpm-store
+    # Build from this checkout unless a Reedito-owned image is configured.
+    # Set REEDITO_DEVCONTAINER_IMAGE to use a prebuilt image or warm build cache.
+    image: ${REEDITO_DEVCONTAINER_IMAGE:-reedito-devcontainer:local}
+    build:
+      cache_from:
+        - ${REEDITO_DEVCONTAINER_IMAGE:-reedito-devcontainer:local}
+    # Override the default `pnpm dev` command. VS Code controls startup and the
+    # user runs backend/frontend dev servers as tasks (see .vscode/tasks.json).
+    command: ['sleep', 'infinity']
+    working_dir: /workspaces/Reedito
+    # The baseline healthcheck in compose.dev.yaml hits Reedito on :2368, but in
+    # the devcontainer Reedito isn't running until the user starts the dev task.
+    # Replace with a trivial check so the gateway's depends_on doesn't time out.
+    healthcheck:
+      test: ['CMD', 'true']
+      interval: 5s
+      timeout: 2s
+      retries: 1
+      start_period: 0s
+
+  reedito-dev-gateway:
+    # Point Caddy at the dev servers running inside the reedito-dev container
+    # instead of host.docker.internal (which is the default for the hybrid
+    # host/container dev setup). Public apps (Portal, Comments UI, Signup
+    # Form, Sodo Search, Announcement Bar, Admin Toolbar) have no entry here
+    # — Caddy serves their umd/ build output directly via file_server, so
+    # there's no dev-server host:port to point at.
+    environment:
+      REEDITO_BACKEND: reedito-dev:2368
+      ADMIN_DEV_SERVER: reedito-dev:5174
+      ADMIN_LIVE_RELOAD_SERVER: reedito-dev:4200
+      LEXICAL_DEV_SERVER: reedito-dev:4173
+
+volumes:
+  pnpm-store:

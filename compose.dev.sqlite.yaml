@@ -1,0 +1,16 @@
+services:
+  mysql:
+    # Prevents mysql container from starting up
+    profiles:
+      - mysql
+
+  reedito-dev:
+    volumes:
+      # Override the named volume so the SQLite DB is accessible on the host.
+      - ./reedito/core/content/data:/home/reedito/reedito/core/content/data
+    environment:
+      database__client: sqlite3
+      database__connection__filename: content/data/reedito-dev.db
+    depends_on:
+      mysql:
+        required: false

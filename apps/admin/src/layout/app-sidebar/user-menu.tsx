@@ -1,0 +1,264 @@
+import React from 'react';
+
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+  Indicator,
+  SidebarMenuButton,
+} from '@reedito/shade/components';
+import { LucideIcon } from '@reedito/shade/utils';
+import { useCurrentUser } from '@reedito/admin-x-framework/api/current-user';
+import { useDeleteSession } from '@reedito/admin-x-framework/api/session';
+import { getReeditoPaths } from '@reedito/admin-x-framework/helpers';
+import { toast } from 'sonner';
+import { type ThemeMode } from '@/hooks/use-theme';
+import { useThemeContext } from '@/providers/theme-context';
+import { useWhatsNew } from '@/whats-new/api';
+import { useBrowseSite } from '@reedito/admin-x-framework/api/site';
+import { UserMenuItem } from './user-menu-item';
+import { UserMenuAvatar } from './user-menu-avatar';
+import { UserMenuHeader } from './user-menu-header';
+import { Link } from '@reedito/admin-x-framework';
+import { getAdminToolbarUrl } from '@/utils/admin-toolbar-url';
+
+function UserMenuProfile() {
+  const currentUser = useCurrentUser();
+
+  return (
+    <UserMenuItem>
+      <Link to={`/settings/staff/${currentUser.data?.slug}`}>
+        <LucideIcon.User />
+        <UserMenuItem.Label>Your profile</UserMenuItem.Label>
+      </Link>
+    </UserMenuItem>
+  );
+}
+
+const THEME_OPTIONS: Array<{ value: ThemeMode; label: string; Icon: typeof LucideIcon.Moon }> = [
+  { value: 'dark', label: 'Dark', Icon: LucideIcon.Moon },
+  { value: 'light', label: 'Light', Icon: LucideIcon.Sun },
+  { value: 'system', label: 'System', Icon: LucideIcon.Monitor },
+];
+
+const THEME_LABELS = Object.fromEntries(
+  THEME_OPTIONS.map(({ value, label }) => [value, label]),
+) as Record<ThemeMode, string>;
+
+function UserMenuAppearance() {
+  const { theme, setTheme, isSettingTheme } = useThemeContext();
+
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger
+        className="cursor-pointer gap-2 text-base [&>svg:last-child]:-ml-1.5 [&>svg:last-child]:size-3.5 [&>svg:last-child]:text-muted-foreground"
+        data-test-nav="appearance"
+      >
+        <LucideIcon.Palette />
+        <UserMenuItem.Label>Appearance</UserMenuItem.Label>
+        <span className="text-sm text-muted-foreground">{THEME_LABELS[theme]}</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent alignOffset={-4} className="min-w-36">
+        {THEME_OPTIONS.map(({ value, label, Icon }) => (
+          <DropdownMenuItem
+            key={value}
+            aria-label={`${label} appearance`}
+            data-test-theme-option={value}
+            disabled={isSettingTheme}
+            onSelect={() => {
+              void setTheme(value);
+            }}
+          >
+            <Icon />
+            <span className="flex-1">{label}</span>
+            {theme === value && (
+              <LucideIcon.Check aria-hidden="true" className="text-muted-foreground" />
+            )}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+function UserMenuSignOut() {
+  const { mutateAsync: deleteSession } = useDeleteSession();
+
+  const handleSignOut = async () => {
+    try {
+      await deleteSession(null);
+      // Full page load, not a router navigation: the session is gone, so
+      // the app must reboot unauthenticated
+      window.location.href = getReeditoPaths().adminRoot;
+    } catch {
+      toast.error("Couldn't sign out. Please try again.");
+    }
+  };
+
+  return (
+    <UserMenuItem
+      asChild={false}
+      onSelect={() => {
+        void handleSignOut();
+      }}
+    >
+      <LucideIcon.LogOut />
+      <UserMenuItem.Label>Sign out</UserMenuItem.Label>
+    </UserMenuItem>
+  );
+}
+
+interface UserMenuProps extends React.ComponentProps<typeof DropdownMenu> {
+  onOpenWhatsNew?: () => void;
+}
+function UserMenu(props: UserMenuProps) {
+  const currentUser = useCurrentUser();
+  const { hasNew } = useWhatsNew();
+
+  return (
+    <DropdownMenu {...props}>
+      <DropdownMenuTrigger asChild>
+        <SidebarMenuButton
+          aria-label="User menu"
+          className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+          size="lg"
+        >
+          <div className="relative">
+            <UserMenuAvatar />
+            {hasNew && (
+              <span className="absolute -top-0.5 -right-0.5">
+                <Indicator
+                  data-testid="whats-new-avatar-badge"
+                  label="New updates available"
+                  size="sm"
+                  variant="success"
+                />
+              </span>
+            )}
+          </div>
+          <div className="grid flex-1 text-left text-base leading-tight">
+            <span className="truncate font-semibold">{currentUser.data?.name}</span>
+            <span className="-mt-px truncate text-sm text-muted-foreground dark:text-gray-800">
+              {currentUser.data?.email}
+            </span>
+          </div>
+          <LucideIcon.ChevronsUpDown
+            className="ml-auto size-4 text-gray-700"
+            data-test-nav="arrow-down"
+          />
+        </SidebarMenuButton>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        className="w-[var(--radix-dropdown-menu-trigger-width)] dark:bg-surface-elevated-2"
+        sideOffset={10}
+      >
+        <UserMenuHeader email={currentUser.data?.email} name={currentUser.data?.name}>
+          <UserMenuAvatar />
+        </UserMenuHeader>
+        <DropdownMenuSeparator />
+        <UserMenuItem
+          asChild={false}
+          data-test-nav="whatsnew"
+          onSelect={() => {
+            props.onOpenWhatsNew?.();
+          }}
+        >
+          <LucideIcon.Sparkles />
+          <UserMenuItem.Label>What’s new?</UserMenuItem.Label>
+          {hasNew && (
+            <div className="flex flex-1 justify-end">
+              <Indicator
+                data-testid="whats-new-menu-badge"
+                label="New updates available"
+                size="sm"
+                variant="success"
+              />
+            </div>
+          )}
+        </UserMenuItem>
+        <UserMenuProfile />
+        <DropdownMenuSeparator />
+        <UserMenuItem>
+          <a
+            href="https://docs.ghost.org/"
+            rel="noopener noreferrer"
+            target="_blank"
+          >
+            <LucideIcon.Book />
+            <UserMenuItem.Label>Original Ghost documentation (upstream)</UserMenuItem.Label>
+          </a>
+        </UserMenuItem>
+        <UserMenuAppearance />
+        <DropdownMenuSeparator />
+        <UserMenuSignOut />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
+ * Floating profile menu for contributor users
+ * Positioned in top-right corner, minimal menu with essential actions only
+ *
+ * Mirrors Ember behavior where contributors have a simplified menu with:
+ * - Posts (navigate to posts list)
+ * - View site (open site in new tab)
+ * - Your profile (navigate to profile settings)
+ * - Appearance selector
+ * - Sign out
+ *
+ * Contributors do not have access to:
+ * - What's new
+ * - Help center / Resources & guides
+ * - Settings navigation
+ */
+function ContributorUserMenu() {
+  const currentUser = useCurrentUser();
+  const site = useBrowseSite();
+  const siteUrl = getAdminToolbarUrl(site.data?.site.url ?? '');
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          aria-label="Open user menu"
+          className="flex items-center justify-center rounded-full border border-border bg-background p-0.5 shadow-lg transition-shadow hover:shadow-xl focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:bg-muted"
+          type="button"
+        >
+          <UserMenuAvatar className="size-11" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="mb-2 min-w-56" side="top" sideOffset={10}>
+        <UserMenuHeader email={currentUser.data?.email} name={currentUser.data?.name}>
+          <UserMenuAvatar />
+        </UserMenuHeader>
+        <DropdownMenuSeparator />
+        <UserMenuItem>
+          <a href="#/posts">
+            <LucideIcon.FileText />
+            <UserMenuItem.Label>Posts</UserMenuItem.Label>
+          </a>
+        </UserMenuItem>
+        <UserMenuItem>
+          <a href={siteUrl} rel="noopener noreferrer" target="_blank">
+            <LucideIcon.ExternalLink />
+            <UserMenuItem.Label>View site</UserMenuItem.Label>
+          </a>
+        </UserMenuItem>
+        <DropdownMenuSeparator />
+        <UserMenuProfile />
+        <UserMenuAppearance />
+        <DropdownMenuSeparator />
+        <UserMenuSignOut />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+export { UserMenu, ContributorUserMenu };

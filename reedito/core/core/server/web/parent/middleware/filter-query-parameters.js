@@ -1,0 +1,94 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.filterQueryParameters = filterQueryParameters;
+const logging_1 = __importDefault(require("@tryghost/logging"));
+const query_parameter_policy_1 = require("../../query-parameter-policy");
+const allowedQueryParameters = new Set(query_parameter_policy_1.queryParameterPolicy.public.map((entry) => entry.name));
+const allowedContentApiQueryParameters = new Set(query_parameter_policy_1.queryParameterPolicy.contentApi.map((entry) => entry.name));
+const CONTENT_API_PATH_PATTERN = /\/reedito\/api\/(?:(?:v[0-9]+|canary)\/content|content)(?:\/|$)/;
+const EXEMPT_PATH_PATTERNS = [
+    /\/reedito\/api(?:\/|$)/,
+    /\/\.reedito(?:\/|$)/,
+    /\/\.well-known(?:\/|$)/,
+    /\/socket\.io(?:\/|$)/,
+];
+const MAX_LOGGED_PARAMETERS = 10;
+const REQUEST_URL_BASE = 'http://ignored.example';
+const replaceQueryString = (requestTarget, filteredRequestTarget) => {
+    const requestUrl = new URL(requestTarget, REQUEST_URL_BASE);
+    const filteredUrl = new URL(filteredRequestTarget, REQUEST_URL_BASE);
+    return `${requestUrl.pathname}${filteredUrl.search}`;
+};
+const replaceParsedQuery = (query, requestTarget) => {
+    for (const parameter of Object.keys(query)) {
+        delete query[parameter];
+    }
+    const { searchParams } = new URL(requestTarget, REQUEST_URL_BASE);
+    for (const parameter of new Set(searchParams.keys())) {
+        const values = searchParams.getAll(parameter);
+        query[parameter] = values.length === 1 ? values[0] : values;
+    }
+};
+const removeUnknownParameters = (searchParams, allowlist) => {
+    const removed = new Set();
+    for (const parameter of [...searchParams.keys()]) {
+        if (!allowlist.has(parameter)) {
+            searchParams.delete(parameter);
+            removed.add(parameter);
+        }
+    }
+    return removed;
+};
+const filterRequestTarget = (requestTarget) => {
+    const { pathname, searchParams } = new URL(requestTarget, REQUEST_URL_BASE);
+    const contentApiRequest = CONTENT_API_PATH_PATTERN.test(pathname);
+    const exemptPath = EXEMPT_PATH_PATTERNS.some((pattern) => pattern.test(pathname));
+    if (!contentApiRequest && exemptPath) {
+        return {
+            requestTarget,
+            removedUnknownParameters: [],
+        };
+    }
+    const allowlist = contentApiRequest ? allowedContentApiQueryParameters : allowedQueryParameters;
+    const removedUnknownParameters = removeUnknownParameters(searchParams, allowlist);
+    if (removedUnknownParameters.size === 0) {
+        return {
+            requestTarget,
+            removedUnknownParameters: [],
+        };
+    }
+    const query = searchParams.toString();
+    return {
+        requestTarget: query ? `${pathname}?${query}` : pathname,
+        removedUnknownParameters: [...removedUnknownParameters].sort(),
+    };
+};
+/**
+ * Applies the host-provided public query parameter allowlist in local development.
+ *
+ * Update the production policy and this manifest together when adding a parameter.
+ * This middleware is enabled by the root pnpm dev Docker Compose configuration.
+ */
+function filterQueryParameters(req, _res, next) {
+    const requestTarget = req.originalUrl;
+    const result = filterRequestTarget(requestTarget);
+    if (result.requestTarget !== requestTarget) {
+        const query = req.query;
+        req.originalUrl = result.requestTarget;
+        req.url = replaceQueryString(req.url, result.requestTarget);
+        replaceParsedQuery(query, result.requestTarget);
+    }
+    if (result.removedUnknownParameters.length > 0) {
+        const strippedParameters = result.removedUnknownParameters
+            .slice(0, MAX_LOGGED_PARAMETERS)
+            .map(encodeURIComponent)
+            .join(', ');
+        const omittedParameterCount = result.removedUnknownParameters.length - MAX_LOGGED_PARAMETERS;
+        const omittedParameters = omittedParameterCount > 0 ? `, and ${omittedParameterCount} more` : '';
+        logging_1.default.warn(`[query-parameter-filter] Stripped undeclared query parameter(s) from ${req.path}: ${strippedParameters}${omittedParameters}`);
+    }
+    next();
+}

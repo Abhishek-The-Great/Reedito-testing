@@ -1,0 +1,60 @@
+import semverParse from 'semver/functions/parse';
+import type { Options } from 'semver';
+
+// Supported version formats:
+// - 6.21.2                          → release tag
+// - 6.21.2+1710072000.abc1234       → commit (server: semver+epoch.sha)
+// - 6.21.2+abc1234                  → commit (admin: semver+sha)
+// - 5.94.1+moya                     → release tag (legacy)
+// - 5.94.1-0-gabcdef+moya           → commit (legacy git describe)
+// - 5.95.0-pre-gabcdef+moya         → commit (legacy canary)
+export function linkToGitHubReleases(
+  version: string,
+  repository = import.meta.env.REEDITO_GITHUB_REPOSITORY || '',
+): string {
+  if (!version || !/^[\w.-]+\/[\w.-]+$/.test(repository)) {
+    return '';
+  }
+
+  const repositoryUrl = `https://github.com/${repository}`;
+
+  // Extract build metadata (everything after +) before semver parsing strips it
+  const plusIndex = version.indexOf('+');
+  const buildMetadata = plusIndex !== -1 ? version.slice(plusIndex + 1) : '';
+  const versionWithoutBuild = plusIndex !== -1 ? version.slice(0, plusIndex) : version;
+
+  // Check build metadata for a commit SHA
+  if (buildMetadata && buildMetadata !== 'moya') {
+    // New format: "epoch.sha" or just "sha"
+    const parts = buildMetadata.split('.');
+    const sha = parts[parts.length - 1];
+
+    if (sha && /^[0-9a-f]{7,40}$/.test(sha)) {
+      return `${repositoryUrl}/commit/${sha}`;
+    }
+  }
+
+  // Check pre-release segment for a commit SHA (legacy format: -0-gabcdef or -pre-gabcdef)
+  try {
+    // note: the type cast here is needed bc semver's types use the wrong Options object
+    const semverVersion = semverParse(versionWithoutBuild, { includePrerelease: true } as Options);
+    const prerelease = semverVersion?.prerelease;
+
+    if (prerelease && prerelease.length > 0) {
+      const splitPrerelease = String(prerelease[0]).split('-');
+      const commitHash = splitPrerelease[1];
+
+      if (commitHash?.startsWith('g')) {
+        return `${repositoryUrl}/commit/${commitHash.slice(1)}`;
+      }
+
+      // Has pre-release but no recognizable commit hash
+      return '';
+    }
+  } catch {
+    return '';
+  }
+
+  // Plain semver (with or without +moya) → release tag
+  return `${repositoryUrl}/releases/tag/v${versionWithoutBuild}`;
+}

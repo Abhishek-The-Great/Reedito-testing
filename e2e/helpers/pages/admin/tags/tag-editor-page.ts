@@ -1,0 +1,47 @@
+import { Locator, Page } from '@playwright/test';
+import { TagDetailsPage } from './tag-details-page';
+import {
+  confirmDeleteTag,
+  deleteTagModal,
+  deleteTagPostsCount,
+} from '@reedito/test-data/selectors/tags';
+
+export class TagEditorPage extends TagDetailsPage {
+  readonly deleteModal: Locator;
+  readonly deleteModalPostsCount: Locator;
+  readonly deleteModalConfirmButton: Locator;
+  readonly tagActionsButton: Locator;
+  readonly deleteMenuItem: Locator;
+
+  constructor(page: Page) {
+    super(page);
+
+    this.pageUrl = '/reedito/#/tags';
+
+    this.deleteModal = page.getByTestId(deleteTagModal).filter({ visible: true });
+    this.deleteModalPostsCount = this.deleteModal.getByTestId(deleteTagPostsCount);
+    this.deleteModalConfirmButton = this.deleteModal.getByTestId(confirmDeleteTag);
+    this.tagActionsButton = page.getByRole('button', { name: 'Tag actions' });
+    this.deleteMenuItem = page.getByRole('menuitem', { name: 'Delete tag' });
+  }
+
+  async gotoTagBySlug(slug: string) {
+    this.pageUrl = `/reedito/#/tags/${slug}`;
+    await this.page.goto(this.pageUrl);
+  }
+
+  async updateTag(name: string, slug: string) {
+    await this.fillTagName(name);
+    await this.fillTagSlug(slug);
+    await this.save();
+  }
+
+  async deleteTag() {
+    await this.tagActionsButton.click();
+    await this.deleteMenuItem.click();
+  }
+
+  async confirmDelete() {
+    await this.deleteModalConfirmButton.click();
+  }
+}

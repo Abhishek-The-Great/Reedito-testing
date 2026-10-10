@@ -1,0 +1,164 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.default = buildCompletionEmail;
+const report_1 = __importDefault(require("./report"));
+const errors_file_1 = __importDefault(require("./errors-file"));
+const { slugify } = require('@tryghost/string');
+const IMPORTED_POST_PREVIEW_LIMIT = 10;
+function escapeHTML(value) {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+function countsFor(run) {
+    const counts = {
+        created: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        warningRows: 0,
+    };
+    for (const row of run.rows) {
+        counts[row.status] += 1;
+        if (row.warnings?.length) {
+            counts.warningRows += 1;
+        }
+    }
+    return counts;
+}
+function headingFor(run, counts) {
+    if (run.status === 'failed') {
+        return 'Your content import could not be completed';
+    }
+    if (counts.failed > 0 && counts.created + counts.updated === 0) {
+        return 'Your content import was unsuccessful';
+    }
+    return 'Your content import is complete';
+}
+function formatNumber(value) {
+    return value.toLocaleString();
+}
+function summaryItems(counts, hasErrorsFile) {
+    const items = [
+        ['Created', counts.created],
+        ['Updated', counts.updated],
+        ['Skipped', counts.skipped],
+        ['Failed', counts.failed],
+    ];
+    return items
+        .map(([label, count]) => {
+        const attachmentCopy = label === 'Failed' && hasErrorsFile ? ' (see attached errors.csv)' : '';
+        return `<li style="margin-bottom: 6px;"><strong>${label}:</strong> ${formatNumber(count)}${attachmentCopy}</li>`;
+    })
+        .join('');
+}
+function importTagSlug(runId) {
+    // Internal tag slugs replace the leading # with "hash-" in the model layer.
+    return slugify(`#Import Run ${runId}`.replace(/^#/, 'hash-'));
+}
+function importedPostLinks(run, adminUrl) {
+    const importedRows = run.rows.filter((row) => row.status === 'created' || row.status === 'updated');
+    if (!importedRows.length) {
+        return '';
+    }
+    const rows = importedRows.filter((row) => row.url);
+    const previewRows = rows.slice(0, IMPORTED_POST_PREVIEW_LIMIT);
+    const hasPages = importedRows.some((row) => row.postType === 'page');
+    const hasPosts = importedRows.some((row) => row.postType !== 'page');
+    const links = previewRows
+        .map((row) => {
+        const title = escapeHTML(row.title || `Row ${row.line}`);
+        return `<li style="margin-bottom: 6px;"><a href="${escapeHTML(row.url)}" style="color: #3A464C;">${title}</a></li>`;
+    })
+        .join('');
+    const remaining = importedRows.length - previewRows.length;
+    const remainingCopy = remaining
+        ? `<p style="font-size: 16px; line-height: 25px; color: #3A464C;">Including ${formatNumber(remaining)} more.</p>`
+        : '';
+    const tag = encodeURIComponent(importTagSlug(run.id));
+    const postsUrl = escapeHTML(new URL(`#/posts?tag=${tag}`, adminUrl).href);
+    const pagesUrl = escapeHTML(new URL(`#/pages?tag=${tag}`, adminUrl).href);
+    let heading = 'Imported posts';
+    if (hasPages) {
+        heading = hasPosts ? 'Imported posts and pages' : 'Imported pages';
+    }
+    const filteredLinks = [
+        hasPosts ? `<a href="${postsUrl}" style="color: #3A464C;">View imported posts</a>` : '',
+        hasPages ? `<a href="${pagesUrl}" style="color: #3A464C;">View imported pages</a>` : '',
+    ]
+        .filter(Boolean)
+        .join(' · ');
+    const preview = links
+        ? `<ul style="font-size: 16px; line-height: 25px; color: #3A464C; padding-left: 24px;">${links}</ul>`
+        : '';
+    return `<h2 style="color: #15212A; font-size: 18px; line-height: 24px; margin: 32px 0 12px;">${heading}</h2>
+      ${preview}
+      ${remainingCopy}
+      <p style="font-size: 16px; line-height: 25px; color: #3A464C;">${filteredLinks}</p>`;
+}
+function renderCompletionEmail(run, recipient, adminUrl, hasErrorsFile) {
+    const counts = countsFor(run);
+    const heading = headingFor(run, counts);
+    const warningCopy = counts.warningRows
+        ? `<p style="font-size: 16px; line-height: 25px; color: #3A464C;"><strong>${formatNumber(counts.warningRows)}</strong> ${counts.warningRows === 1 ? 'post has' : 'posts have'} warnings.</p>`
+        : '';
+    const failureCopy = run.status === 'failed'
+        ? '<p style="font-size: 16px; line-height: 25px; color: #3A464C;">Something went wrong on our end before the import could finish. There is nothing wrong with your file, and it is safe to try again.</p>'
+        : '';
+    const escapedRecipient = escapeHTML(recipient);
+    return `<!doctype html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <title>${heading}</title>
+  </head>
+  <body style="background-color: #ffffff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #3A464C; margin: 0; padding: 0;">
+    <div style="box-sizing: border-box; margin: 0 auto; max-width: 540px; padding: 40px 20px;">
+      <p style="color: #15212A; font-size: 20px; font-weight: 600; margin: 0 0 40px; text-align: center;">Reedito</p>
+      <h1 style="color: #15212A; font-size: 21px; line-height: 25px; margin: 0 0 24px;">${heading}</h1>
+      ${failureCopy}
+      <p style="font-size: 16px; line-height: 25px; color: #3A464C;">The import processed ${formatNumber(run.total)} ${run.total === 1 ? 'row' : 'rows'}:</p>
+      <ul style="font-size: 16px; line-height: 25px; color: #3A464C; padding-left: 24px;">${summaryItems(counts, hasErrorsFile)}</ul>
+      ${warningCopy}
+      ${importedPostLinks(run, adminUrl)}
+      <p style="color: #738A94; font-size: 11px; line-height: 18px; margin-top: 64px;">This email was sent to <a href="mailto:${escapedRecipient}" style="color: #738A94;">${escapedRecipient}</a>.</p>
+    </div>
+  </body>
+</html>`;
+}
+function buildCompletionEmail(run, recipient, adminUrl) {
+    const counts = countsFor(run);
+    const report = (0, report_1.default)(run);
+    const errorsFile = (0, errors_file_1.default)(run);
+    const attachments = [];
+    if (report) {
+        attachments.push({
+            filename: 'report.csv',
+            content: report,
+            contentType: 'text/csv',
+            contentDisposition: 'attachment',
+        });
+    }
+    if (errorsFile) {
+        attachments.push({
+            filename: 'errors.csv',
+            content: errorsFile,
+            contentType: 'text/csv',
+            contentDisposition: 'attachment',
+        });
+    }
+    return {
+        to: recipient,
+        subject: headingFor(run, counts),
+        html: renderCompletionEmail(run, recipient, adminUrl, Boolean(errorsFile)),
+        forceTextContent: true,
+        attachments,
+    };
+}

@@ -1,0 +1,8 @@
+services:
+  reedito-dev:
+    environment:
+      url: ${PUBLIC_URL}
+
+  reedito-dev-gateway:
+    ports: !override
+      - '2370:80'

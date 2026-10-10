@@ -1,0 +1,8 @@
+[submodule "reedito/core/content/themes/casper"]
+	path = reedito/core/content/themes/casper
+	url = ../../TryGhost/Casper.git
+	ignore = all
+[submodule "reedito/core/content/themes/source"]
+	path = reedito/core/content/themes/source
+	url = ../../TryGhost/Source.git
+	ignore = all

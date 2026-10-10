@@ -1,0 +1,32 @@
+[
+  {
+    "packageName": "@reedito/portal",
+    "path": "apps/portal",
+    "configKey": "portal"
+  },
+  {
+    "packageName": "@reedito/sodo-search",
+    "path": "apps/sodo-search",
+    "configKey": "sodoSearch"
+  },
+  {
+    "packageName": "@reedito/comments-ui",
+    "path": "apps/comments-ui",
+    "configKey": "comments"
+  },
+  {
+    "packageName": "@reedito/signup-form",
+    "path": "apps/signup-form",
+    "configKey": "signupForm"
+  },
+  {
+    "packageName": "@reedito/announcement-bar",
+    "path": "apps/announcement-bar",
+    "configKey": "announcementBar"
+  },
+  {
+    "packageName": "@reedito/admin-toolbar",
+    "path": "apps/admin-toolbar",
+    "configKey": "adminToolbar"
+  }
+]

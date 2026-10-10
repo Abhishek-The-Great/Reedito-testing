@@ -1,0 +1,180 @@
+name: reedito-dev
+
+services:
+  mysql:
+    image: mysql:8.4.11@sha256:85b9bf2e29cf836ecb8c2a15a935d4ba0c606631dff1dd79531a11983c638f2a
+    container_name: reedito-dev-mysql
+    command: --innodb-buffer-pool-size=1G --innodb-log-buffer-size=500M --innodb-change-buffer-max-size=50 --innodb-flush-log-at-trx_commit=0 --innodb-flush-method=O_DIRECT --log-error-verbosity=1
+    ports:
+      - '3306:3306'
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-reedito_dev}
+      MYSQL_USER: reedito
+      MYSQL_PASSWORD: reedito
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'mysql',
+          '-h',
+          '127.0.0.1',
+          '-uroot',
+          '-p${MYSQL_ROOT_PASSWORD:-root}',
+          '-e',
+          'SELECT 1',
+        ]
+      interval: 1s
+      retries: 120
+      timeout: 5s
+      start_period: 10s
+
+  redis:
+    image: redis:7.4@sha256:71da9275c5f3fcb97d0fa0c8c5b36cc995327265420f17a04bfd544f458059f7
+    container_name: reedito-dev-redis
+    command: ['redis-server', '--loglevel', 'warning']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - --raw
+        - incr
+        - ping
+      interval: 1s
+      retries: 120
+
+  mailpit:
+    image: axllent/mailpit@sha256:d5ecbb067db3705fa953d79e1b7f81ef84038df67aba6c52825d8c02a1ea748a
+    container_name: reedito-dev-mailpit
+    command: ['--quiet']
+    ports:
+      - '1025:1025' # SMTP server
+      - '8025:8025' # Web interface
+      - '8026:8025' # Web interface (for e2e tests)
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://localhost:8025']
+      interval: 1s
+      retries: 30
+
+  # Main development Reedito instance
+  # Additional instances can be created programmatically via E2E ReeditoManager
+  reedito-dev:
+    build:
+      context: ./
+      dockerfile: docker/reedito-dev/Dockerfile
+    container_name: reedito-dev
+    working_dir: /home/reedito/reedito/core
+    command: ['pnpm', 'dev']
+    # The entrypoint drains Reedito before exiting; give that longer than Docker's 10s
+    stop_grace_period: 45s
+    volumes:
+      # Mount the backend source as whole-directory mounts instead of
+      # enumerating each server-graph workspace package. `pnpm dev` runs in
+      # reedito/core, and pnpm's verify-deps-before-run only checks reedito/core's
+      # own dependency closure — which is fully installed in the root
+      # /home/reedito/node_modules baked into the image and never mounted over —
+      # so the non-server packages these dirs also expose (e.g. koenig-lexical)
+      # fall outside that closure and don't trigger a
+      # workspace repair. Because root node_modules is never mounted,
+      # linux-built native modules survive; each package's local node_modules
+      # holds only relative symlinks that re-resolve into the root store.
+      # verify-deps-before-run=false is set below as belt-and-suspenders in
+      # case a future pnpm widens that check back to the whole workspace.
+      - ./reedito:/home/reedito/reedito
+      - ./koenig:/home/reedito/koenig
+      - ./configs:/home/reedito/configs
+      - ./packages:/home/reedito/packages
+      # Mount specific content subdirectories to preserve themes/adapters from source
+      - reedito-dev-data:/home/reedito/reedito/core/content/data
+      - reedito-dev-images:/home/reedito/reedito/core/content/images
+      - reedito-dev-media:/home/reedito/reedito/core/content/media
+      - reedito-dev-files:/home/reedito/reedito/core/content/files
+      - reedito-dev-logs:/home/reedito/reedito/core/content/logs
+      - shared-config:/mnt/shared-config:ro
+    environment:
+      NODE_ENV: development
+      NODE_TLS_REJECT_UNAUTHORIZED: '0'
+      DEBUG: ${DEBUG:-}
+      REEDITO_GITHUB_REPOSITORY: ${REEDITO_GITHUB_REPOSITORY:-}
+      REEDITO_CHANGELOG_URL: ${REEDITO_CHANGELOG_URL:-}
+      REEDITO_MIGRATION_URL: ${REEDITO_MIGRATION_URL:-}
+      pnpm_config_verify_deps_before_run: 'false'
+      database__client: mysql2
+      database__connection__host: mysql
+      database__connection__user: root
+      database__connection__password: ${MYSQL_ROOT_PASSWORD:-root}
+      database__connection__database: ${MYSQL_DATABASE:-reedito_dev}
+      server__host: 0.0.0.0
+      server__port: 2368
+      # Apply the host-provided public query parameter allowlist in local development
+      queryParameterFiltering__enabled: '${QUERY_PARAMETER_FILTERING_ENABLED:-true}'
+      mail__transport: SMTP
+      mail__options__host: mailpit
+      mail__options__port: 1025
+      # Redis cache (optional)
+      adapters__cache__Redis__host: redis
+      adapters__cache__Redis__port: 6379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:2368',{redirect:'manual'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))",
+        ]
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Caddy reverse proxy for the main dev instance
+  # Routes Reedito backend + proxies asset requests to host dev servers
+  reedito-dev-gateway:
+    build:
+      context: ./docker/dev-gateway
+      dockerfile: Dockerfile
+    container_name: reedito-dev-gateway
+    environment:
+      ANALYTICS_PROXY_TARGET: ${ANALYTICS_PROXY_TARGET:-analytics:3000}
+    ports:
+      - '2368:80'
+      - '80:80'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      # Mount Caddyfile for live config changes without rebuilding
+      - ./docker/dev-gateway/Caddyfile:/etc/caddy/Caddyfile:ro
+      # All workspace apps mounted read-only. Caddy file_server resolves
+      # /srv/apps/<name>/umd dynamically for the public-app routes (see
+      # the Caddyfile @public_app block). Replaces the per-app `vite preview`
+      # sirv layer + avoids per-app bind mounts.
+      - ./apps:/srv/apps:ro
+    depends_on:
+      reedito-dev:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+  redis-data:
+  shared-config:
+  reedito-dev-data:
+  reedito-dev-images:
+  reedito-dev-media:
+  reedito-dev-files:
+  reedito-dev-logs:
+
+networks:
+  default:
+    name: reedito_dev

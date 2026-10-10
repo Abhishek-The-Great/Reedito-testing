@@ -1,0 +1,47 @@
+import EmberRouter from '@ember/routing/router';
+import config from 'reedito-admin/config/environment';
+import reeditoPaths from 'reedito-admin/utils/reedito-paths';
+
+const Router = EmberRouter.extend({
+    location: config.locationType, // use HTML5 History API instead of hash-tag based URLs
+    rootURL: reeditoPaths().adminRoot // admin interface lives under sub-directory /reedito
+});
+
+// eslint-disable-next-line array-callback-return
+Router.map(function () {
+    this.route('setup');
+
+    this.route('signin');
+    this.route('signin-verify', {path: '/signin/verify'});
+    this.route('signout');
+    this.route('signup', {path: '/signup/:token'});
+    this.route('creator-signup', {path: '/join'});
+    this.route('reset', {path: '/reset/:token'});
+
+    this.route('site');
+
+    this.route('pro', function () {
+        this.route('pro-sub', {path: '/*sub'});
+    });
+
+    this.route('posts');
+    this.route('posts.debug', {path: '/posts/analytics/:post_id/debug'});
+    this.route('restore-posts', {path: '/restore'});
+
+    this.route('pages');
+
+    this.route('lexical-editor', {path: 'editor'}, function () {
+        this.route('new', {path: ':type'});
+        this.route('edit', {path: ':type/:post_id'});
+    });
+
+    this.route('migrate', function () {
+        this.route('migrate', {path: '/*platform'});
+    });
+
+    this.route('members-activity');
+
+    this.route('react-fallback', {path: '/*path'});
+});
+
+export default Router;

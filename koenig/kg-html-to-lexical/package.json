@@ -1,0 +1,59 @@
+{
+  "name": "@reedito/kg-html-to-lexical",
+  "version": "1.4.0",
+  "description": "Converts HTML strings into Lexical editor state for Reedito",
+  "license": "MIT",
+  "author": "Reedito contributors",
+  "files": [
+    "build",
+    "LICENSE",
+    "README.md"
+  ],
+  "main": "build/cjs/index.js",
+  "module": "build/esm/index.js",
+  "types": "build/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./build/esm/index.d.ts",
+      "import": "./build/esm/index.js",
+      "require": "./build/cjs/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "tsc --watch --preserveWatchOutput --sourceMap",
+    "build": "tsc && tsc -p tsconfig.cjs.json && echo '{\"type\":\"module\"}' > build/esm/package.json",
+    "test:unit": "NODE_ENV=testing vitest run --coverage",
+    "test:types": "tsc --noEmit",
+    "test": "pnpm run '/^test:/'",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@lexical/clipboard": "0.13.1",
+    "@lexical/headless": "0.13.1",
+    "@lexical/html": "0.13.1",
+    "@lexical/link": "0.13.1",
+    "@lexical/list": "0.13.1",
+    "@lexical/rich-text": "0.13.1",
+    "@reedito/kg-default-nodes": "workspace:~",
+    "@reedito/kg-default-transforms": "workspace:~",
+    "jsdom": "catalog:",
+    "lexical": "0.13.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "catalog:",
+    "@types/jsdom": "catalog:",
+    "@typescript/native": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
+    "eslint-plugin-ghost": "catalog:",
+    "typescript": "catalog:",
+    "typescript-eslint": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0"
+  }
+}

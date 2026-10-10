@@ -1,0 +1,1101 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.createDatabaseAutomationsRepository = createDatabaseAutomationsRepository;
+const errors_1 = __importDefault(require("@tryghost/errors"));
+const tpl_1 = __importDefault(require("@tryghost/tpl"));
+const node_crypto_1 = __importDefault(require("node:crypto"));
+const bson_objectid_1 = __importDefault(require("bson-objectid"));
+const dequal_1 = require("dequal");
+// @ts-expect-error This module currently lacks type definitions.
+const lexical_1 = __importDefault(require("../../lib/lexical"));
+const url_utils_1 = __importDefault(require("../../../shared/url-utils"));
+const constants_1 = require("../member-welcome-emails/constants");
+const date_1 = require("../../lib/db-types/date");
+const stale_lock_cutoff_1 = require("./stale-lock-cutoff");
+const HOUR_MS = 60 * 60 * 1000;
+const DEFAULT_WELCOME_EMAIL_AUTOMATIONS = [
+    {
+        name: 'Free member welcome flow',
+        slug: constants_1.MEMBER_WELCOME_EMAIL_SLUGS.free,
+    },
+    {
+        name: 'Paid member welcome flow',
+        slug: constants_1.MEMBER_WELCOME_EMAIL_SLUGS.paid,
+    },
+];
+const messages = {
+    invalidAutomationActionRevision: 'Automation action "{actionId}" of type "{actionType}" is missing required revision field "{field}".',
+    conflictingAutomationActionId: 'Automation action "{actionId}" already exists and cannot be inserted.',
+    conflictingAutomationActionType: 'Automation action "{actionId}" already exists with a different type.',
+    defaultEmailDesignSettingNotFound: 'Default automated email design setting not found.',
+};
+const DEFAULT_EMAIL_DESIGN_SETTING_REFERENCE = constants_1.DEFAULT_EMAIL_DESIGN_SETTING_SLUG;
+function createDatabaseAutomationsRepository({ knex, fakeWaitHoursMultiplier, }) {
+    return {
+        async browse({ includeStats }) {
+            return await knex.transaction(async (trx) => {
+                await ensureDefaultAutomations(trx);
+                const data = includeStats
+                    ? (await loadAutomationsWithStats(trx)).map((row) => buildAutomationBrowseResult(row))
+                    : (await loadAutomations(trx)).map((row) => buildAutomationSummary(row));
+                return {
+                    data,
+                    meta: {
+                        pagination: buildPagination(data.length),
+                    },
+                };
+            });
+        },
+        async getById(id) {
+            return await knex.transaction(async (trx) => {
+                const automation = await loadAutomation(trx, id);
+                if (!automation) {
+                    return null;
+                }
+                return await buildAutomation(trx, automation);
+            });
+        },
+        async getAutomationActionLinks(automationId, actionId) {
+            const action = await knex('automation_actions')
+                .select('id')
+                .where({
+                id: actionId,
+                automation_id: automationId,
+            })
+                .whereNull('deleted_at')
+                .first();
+            if (!action) {
+                return null;
+            }
+            const rows = await knex('redirects as redirects')
+                .countDistinct({ clicked_count: 'members_click_events.member_id' })
+                .select(knex.raw('MIN(??) as ??', ['redirects.to', 'url']))
+                .innerJoin('automation_action_revisions as revisions', 'revisions.id', 'redirects.automation_action_revision_id')
+                .leftJoin('members_click_events', 'members_click_events.redirect_id', 'redirects.id')
+                .where('revisions.action_id', actionId)
+                .whereNotNull('redirects.to_hash')
+                .groupBy('redirects.to_hash')
+                .orderBy('clicked_count', 'desc')
+                .orderBy('url', 'asc');
+            return rows.map((row) => ({
+                url: url_utils_1.default.transformReadyToAbsolute(row.url),
+                clicked_count: Number(row.clicked_count),
+            }));
+        },
+        async edit(id, data) {
+            return await knex.transaction(async (trx) => {
+                const automation = await loadAutomation(trx, id);
+                if (!automation) {
+                    return null;
+                }
+                const now = new Date();
+                const updatedAutomation = await updateAutomation(trx, {
+                    ...automation,
+                    status: data.status,
+                    updated_at: (0, date_1.toDatabaseDate)(now),
+                });
+                await replaceAutomationGraph(trx, updatedAutomation.id, data.actions, data.edges);
+                if (updatedAutomation.status === 'inactive') {
+                    await cancelCancelablePendingStepsForAutomation(trx, updatedAutomation.id, now);
+                }
+                return await buildAutomation(trx, updatedAutomation);
+            });
+        },
+        async trigger(options) {
+            return await knex.transaction((trx) => trigger(trx, {
+                ...options,
+                fakeWaitHoursMultiplier,
+            }));
+        },
+        async fetchAndLockSteps(limit) {
+            return await knex.transaction((trx) => fetchAndLockSteps(trx, limit));
+        },
+        async finishStepAndEnqueueNext(step) {
+            return await knex.transaction((trx) => finishStepAndEnqueueNext(trx, {
+                step,
+                fakeWaitHoursMultiplier,
+            }));
+        },
+        async markStepTerminal(step, status) {
+            return await knex.transaction((trx) => markStepTerminal(trx, step, status));
+        },
+        async retryStep(step, retryAt) {
+            return await knex.transaction((trx) => retryStep(trx, step, retryAt));
+        },
+        async recordEmailSent(options) {
+            await knex.transaction(async (trx) => {
+                await trx('automation_action_revisions')
+                    .where('id', options.automationActionRevisionId)
+                    .update({
+                    email_sent_count: trx.raw('COALESCE(??, 0) + ?', ['email_sent_count', 1]),
+                });
+                const now = (0, date_1.toDatabaseDate)(new Date());
+                await trx('automated_email_recipients').insert({
+                    id: (0, bson_objectid_1.default)().toHexString(),
+                    member_id: options.memberId,
+                    member_uuid: options.memberUuid,
+                    member_email: options.memberEmail,
+                    member_name: options.memberName,
+                    automation_action_revision_id: options.automationActionRevisionId,
+                    automation_run_step_id: options.automationRunStepId,
+                    ...(options.mailgunMessageId ? { mailgun_message_id: options.mailgunMessageId } : {}),
+                    track_clicks: options.trackClicks,
+                    track_opens: options.trackOpens,
+                    created_at: now,
+                    updated_at: now,
+                });
+            });
+        },
+        async getAutomatedEmailRecipientsByMailgunIds(mailgunMessageIds) {
+            if (mailgunMessageIds.length === 0) {
+                return [];
+            }
+            return await knex('automated_email_recipients')
+                .select('id', 'mailgun_message_id', 'automation_action_revision_id')
+                .whereNotNull('automation_action_revision_id')
+                .whereIn('mailgun_message_id', mailgunMessageIds);
+        },
+        async trackEmailDeliveredAndOpened(eventsByAutomatedEmailRecipientId) {
+            if (eventsByAutomatedEmailRecipientId.size === 0) {
+                return;
+            }
+            await knex.transaction(async (trx) => {
+                const revisionIds = new Set();
+                for (const { openedAt, automationActionRevisionId, } of eventsByAutomatedEmailRecipientId.values()) {
+                    if (openedAt) {
+                        revisionIds.add(automationActionRevisionId);
+                    }
+                }
+                const orderedRevisionIds = await lockActionRevisions(trx, revisionIds);
+                const notYetOpened = await lockNotYetOpened(trx, eventsByAutomatedEmailRecipientId);
+                const newOpensPerRevision = new Map();
+                for (const [id, { deliveredAt, openedAt, automationActionRevisionId },] of eventsByAutomatedEmailRecipientId) {
+                    const updates = {};
+                    if (deliveredAt) {
+                        updates.delivered_at = trx.raw('CASE WHEN delivered_at IS NULL OR delivered_at > ? THEN ? ELSE delivered_at END', [deliveredAt, deliveredAt]);
+                    }
+                    if (openedAt) {
+                        updates.opened_at = trx.raw('CASE WHEN opened_at IS NULL OR opened_at > ? THEN ? ELSE opened_at END', [openedAt, openedAt]);
+                    }
+                    if (Object.keys(updates).length === 0) {
+                        continue;
+                    }
+                    await trx('automated_email_recipients').where({ id }).update(updates);
+                    if (openedAt && notYetOpened.has(id)) {
+                        newOpensPerRevision.set(automationActionRevisionId, (newOpensPerRevision.get(automationActionRevisionId) ?? 0) + 1);
+                    }
+                }
+                for (const id of orderedRevisionIds) {
+                    const opens = newOpensPerRevision.get(id);
+                    if (!opens) {
+                        continue;
+                    }
+                    await trx('automation_action_revisions')
+                        .where({ id })
+                        .update({
+                        email_opened_count: trx.raw('COALESCE(email_opened_count, 0) + ?', [opens]),
+                    });
+                }
+            });
+        },
+        async trackEmailClicked({ automationActionRevisionId, automationRunStepId, memberId, clickedAt }, { transacting } = {}) {
+            const trackClick = async (trx) => {
+                await lockActionRevisions(trx, [automationActionRevisionId]);
+                const recipient = await trx('automated_email_recipients')
+                    .select('id', 'clicked_at')
+                    .where({
+                    automation_action_revision_id: automationActionRevisionId,
+                    automation_run_step_id: automationRunStepId,
+                    member_id: memberId,
+                    track_clicks: true,
+                })
+                    .forUpdate()
+                    .first();
+                if (!recipient || recipient.clicked_at !== null) {
+                    return;
+                }
+                const updated = await trx('automated_email_recipients')
+                    .where({ id: recipient.id })
+                    .whereNull('clicked_at')
+                    .update({ clicked_at: clickedAt });
+                if (updated === 0) {
+                    return;
+                }
+                await trx('automation_action_revisions')
+                    .where({ id: automationActionRevisionId })
+                    .update({
+                    email_clicked_count: trx.raw('COALESCE(email_clicked_count, 0) + 1'),
+                });
+            };
+            if (transacting) {
+                await trackClick(transacting);
+                return;
+            }
+            await knex.transaction(trackClick);
+        },
+    };
+}
+/**
+ * Lock revisions before recipients because inserting a recipient takes a shared
+ * foreign-key lock on its revision. Updating that revision later can deadlock
+ * with another transaction that has already locked the revision and is waiting
+ * for the recipient. Keep multi-revision lock acquisition deterministic.
+ */
+async function lockActionRevisions(trx, revisionIds) {
+    const sortedRevisionIds = [...new Set(revisionIds)].sort((left, right) => left.localeCompare(right));
+    if (sortedRevisionIds.length > 0) {
+        await trx('automation_action_revisions')
+            .select('id')
+            .whereIn('id', sortedRevisionIds)
+            .forUpdate();
+    }
+    return sortedRevisionIds;
+}
+/**
+ * Which of these recipients have yet to open, and so should count towards their
+ * revision's open count. Locks them for the transaction, so a worker racing on
+ * the same open reads them as opened and doesn't count them a second time.
+ */
+async function lockNotYetOpened(trx, eventsByAutomatedEmailRecipientId) {
+    const ids = [];
+    for (const [id, { openedAt }] of eventsByAutomatedEmailRecipientId) {
+        if (openedAt) {
+            ids.push(id);
+        }
+    }
+    if (ids.length === 0) {
+        return new Set();
+    }
+    const rows = await trx('automated_email_recipients')
+        .select('id')
+        .whereIn('id', ids)
+        .whereNull('opened_at')
+        .forUpdate();
+    return new Set(rows.map((row) => row.id));
+}
+async function ensureDefaultAutomations(trx) {
+    for (const defaults of DEFAULT_WELCOME_EMAIL_AUTOMATIONS) {
+        const automation = await ensureAutomation(trx, defaults);
+        await ensureWelcomeEmailAction(trx, automation.id);
+    }
+}
+async function ensureAutomation(trx, defaults) {
+    const now = (0, date_1.toDatabaseDate)(new Date());
+    const id = (0, bson_objectid_1.default)().toHexString();
+    await trx('automations')
+        .insert({
+        id,
+        status: 'inactive',
+        name: defaults.name,
+        slug: defaults.slug,
+        created_at: now,
+        updated_at: now,
+    })
+        .onConflict('slug')
+        .ignore();
+    return requireAutomation(await loadAutomationBySlug(trx, defaults.slug), defaults.slug);
+}
+async function ensureWelcomeEmailAction(trx, automationId) {
+    const hasActions = await trx('automation_actions')
+        .where('automation_id', automationId)
+        .whereNull('deleted_at')
+        .first('id');
+    if (hasActions) {
+        return;
+    }
+    await trx('automations').select('id').where('id', automationId).forUpdate().first();
+    const email = await trx('welcome_email_automated_emails')
+        .select('subject', 'lexical', 'email_design_setting_id')
+        .where('welcome_email_automation_id', automationId)
+        .orderBy(['created_at', 'id'])
+        .first();
+    if (!email) {
+        return;
+    }
+    const now = (0, date_1.toDatabaseDate)(new Date());
+    const actionId = (0, bson_objectid_1.default)().toHexString();
+    await insertActions(trx, [
+        {
+            id: actionId,
+            created_at: now,
+            updated_at: now,
+            automation_id: automationId,
+            type: 'send_email',
+        },
+    ]);
+    await insertActionRevisions(trx, [
+        {
+            actionId,
+            action: {
+                id: actionId,
+                type: 'send_email',
+                data: {
+                    email_subject: email.subject,
+                    email_lexical: email.lexical ?? '',
+                    email_design_setting_id: email.email_design_setting_id,
+                },
+            },
+            createdAt: getNextRevisionCreatedAt(null, now),
+        },
+    ]);
+}
+async function trigger(trx, options) {
+    const { memberEmail, memberId, memberStatus, fakeWaitHoursMultiplier } = options;
+    const firstAction = await findFirstActionRevision(trx, memberStatus);
+    if (!firstAction) {
+        return;
+    }
+    const now = new Date();
+    const nowString = (0, date_1.toDatabaseDate)(now);
+    const readyAt = getReadyAtForAction(firstAction, now, fakeWaitHoursMultiplier);
+    const run = {
+        id: (0, bson_objectid_1.default)().toHexString(),
+        created_at: nowString,
+        updated_at: nowString,
+        automation_id: firstAction.automation_id,
+        member_id: memberId,
+        member_email: memberEmail,
+    };
+    await trx('automation_runs').insert(run);
+    await insertRunStep(trx, {
+        automationRunId: run.id,
+        automationActionRevisionId: firstAction.automation_action_revision_id,
+        now,
+        readyAt,
+    });
+}
+async function insertRunStep(trx, { automationRunId, automationActionRevisionId, now, readyAt, }) {
+    const nowString = (0, date_1.toDatabaseDate)(now);
+    await trx('automation_run_steps').insert({
+        id: (0, bson_objectid_1.default)().toHexString(),
+        created_at: nowString,
+        updated_at: nowString,
+        automation_run_id: automationRunId,
+        automation_action_revision_id: automationActionRevisionId,
+        ready_at: (0, date_1.toDatabaseDate)(readyAt),
+    });
+}
+async function fetchAndLockSteps(trx, limit) {
+    // Two things make this tricky:
+    //
+    // - We want to do row-level locking, so multiple calls don't step on each other.
+    // - We can't `UPDATE` a fixed number of rows.
+    //
+    // To get around these problems, here's what we do:
+    //
+    // 1. Select up to `limit` candidate rows.
+    // 2. Try to lock those rows.
+    // 3. Select any rows we successfully locked.
+    const now = new Date();
+    const nowString = (0, date_1.toDatabaseDate)(now);
+    const staleLockCutoff = (0, stale_lock_cutoff_1.getStaleLockCutoff)(now);
+    const staleLockCutoffString = (0, date_1.toDatabaseDate)(staleLockCutoff);
+    const lockId = node_crypto_1.default.randomUUID();
+    // 1. Select up to `limit` candidate rows.
+    const candidates = await trx('automation_run_steps')
+        .select('id')
+        .where('status', 'pending')
+        .where('ready_at', '<=', nowString)
+        .where((builder) => {
+        builder.whereNull('locked_by').orWhere('locked_at', '<', staleLockCutoffString);
+    })
+        .orderBy(['ready_at', 'created_at', 'id'])
+        .limit(limit);
+    if (candidates.length === 0) {
+        return {
+            steps: [],
+            nextStepReadyAt: await findNextPendingReadyAt(trx, staleLockCutoff),
+        };
+    }
+    const candidateIds = candidates.map((candidate) => candidate.id);
+    // 2. Try to lock those rows.
+    await trx('automation_run_steps')
+        .update({
+        locked_by: lockId,
+        locked_at: nowString,
+        started_at: nowString,
+        updated_at: nowString,
+    })
+        .increment('step_attempts', 1)
+        .whereIn('id', candidateIds)
+        .where('status', 'pending')
+        .where('ready_at', '<=', nowString)
+        .where((builder) => {
+        builder.whereNull('locked_by').orWhere('locked_at', '<', staleLockCutoffString);
+    });
+    // 3. Select any rows we successfully locked.
+    const rows = await trx('automation_run_steps as step')
+        .select('step.id as id', 'step.locked_by as locked_by', 'step.automation_run_id as automation_run_id', 'run.automation_id as automation_id', 'automation.slug as automation_slug', 'automation.status as automation_status', 'run.member_id as member_id', 'run.member_email as member_email', 'action.id as action_id', 'revision.id as automation_action_revision_id', 'action.type as type', 'step.ready_at as ready_at', 'step.step_attempts as step_attempts', 'revision.wait_hours as wait_hours', 'revision.email_subject as email_subject', 'revision.email_lexical as email_lexical', 'revision.email_design_setting_id as email_design_setting_id')
+        .innerJoin('automation_runs as run', 'run.id', 'step.automation_run_id')
+        .innerJoin('automations as automation', 'automation.id', 'run.automation_id')
+        .innerJoin('automation_action_revisions as revision', 'revision.id', 'step.automation_action_revision_id')
+        .innerJoin('automation_actions as action', 'action.id', 'revision.action_id')
+        .whereIn('step.id', candidateIds)
+        .where('step.locked_by', lockId)
+        .orderBy(['step.ready_at', 'step.created_at', 'step.id']);
+    return {
+        steps: rows.map((row) => buildStepToRun(row)),
+        nextStepReadyAt: await findNextPendingReadyAt(trx, staleLockCutoff),
+    };
+}
+async function findNextPendingReadyAt(trx, staleLockCutoff) {
+    const row = await trx('automation_run_steps')
+        .select({ next_ready_at: 'ready_at' })
+        .where('status', 'pending')
+        .where((builder) => {
+        builder.whereNull('locked_by').orWhere('locked_at', '<', (0, date_1.toDatabaseDate)(staleLockCutoff));
+    })
+        .orderBy('ready_at')
+        .first();
+    return row?.next_ready_at ? (0, date_1.fromDatabaseDate)(row.next_ready_at) : null;
+}
+function buildStepToRun(row) {
+    const base = {
+        id: row.id,
+        step_attempts: row.step_attempts,
+        ready_at: (0, date_1.fromDatabaseDate)(row.ready_at),
+        locked_by: row.locked_by,
+        automation_run_id: row.automation_run_id,
+        automation_id: row.automation_id,
+        automation_slug: row.automation_slug,
+        automation_status: row.automation_status,
+        member_id: row.member_id,
+        member_email: row.member_email,
+        action_id: row.action_id,
+        automation_action_revision_id: row.automation_action_revision_id,
+    };
+    switch (row.type) {
+        case 'wait':
+            return {
+                ...base,
+                type: 'wait',
+                wait_hours: requireValue(row, 'wait_hours'),
+            };
+        case 'send_email':
+            return {
+                ...base,
+                type: 'send_email',
+                email_subject: requireValue(row, 'email_subject'),
+                email_lexical: requireValue(row, 'email_lexical'),
+                email_design_setting_id: row.email_design_setting_id,
+            };
+        default:
+            throw new errors_1.default.InternalServerError({
+                message: `Unexpected action type from database: ${row.type}`,
+            });
+    }
+}
+async function findFirstActionRevision(trx, memberStatus) {
+    const automationSlug = constants_1.MEMBER_WELCOME_EMAIL_SLUGS[memberStatus];
+    const row = await trx('automations as automation')
+        .select('automation.id as automation_id', 'actions.id as action_id', 'revisions.id as automation_action_revision_id', 'actions.type as type', 'revisions.wait_hours as wait_hours')
+        .innerJoin('automation_actions as actions', 'actions.automation_id', 'automation.id')
+        .innerJoin('automation_action_revisions as revisions', 'revisions.action_id', 'actions.id')
+        .where('automation.slug', automationSlug)
+        .where('automation.status', 'active')
+        .whereNull('actions.deleted_at')
+        .whereNotExists(trx('automation_action_edges as edge')
+        .select('edge.target_action_id')
+        .innerJoin('automation_actions as source_actions', 'source_actions.id', 'edge.source_action_id')
+        .whereNull('source_actions.deleted_at')
+        .where('edge.target_action_id', trx.ref('actions.id')))
+        .where('revisions.created_at', trx('automation_action_revisions')
+        .max('created_at')
+        .where('action_id', trx.ref('actions.id')))
+        .orderBy(['actions.created_at', 'actions.id'])
+        .first();
+    return row ?? null;
+}
+async function finishStepAndEnqueueNext(trx, options) {
+    const { step, fakeWaitHoursMultiplier } = options;
+    const didFinish = await markStepTerminal(trx, step, 'finished');
+    if (!didFinish) {
+        return null;
+    }
+    if (!(await isRunAutomationActive(trx, step.automation_run_id))) {
+        return null;
+    }
+    const next = await findNextActionRevision(trx, step.action_id);
+    if (!next) {
+        return null;
+    }
+    const now = new Date();
+    const nextReadyAt = getReadyAtForAction(next, now, fakeWaitHoursMultiplier);
+    await insertRunStep(trx, {
+        automationRunId: step.automation_run_id,
+        automationActionRevisionId: next.automation_action_revision_id,
+        now,
+        readyAt: nextReadyAt,
+    });
+    return nextReadyAt;
+}
+async function findNextActionRevision(trx, sourceActionId) {
+    const row = await trx('automation_action_edges as edge')
+        .select('action.id as action_id', 'revision.id as automation_action_revision_id', 'action.type as type', 'revision.wait_hours as wait_hours')
+        .innerJoin('automation_actions as action', 'action.id', 'edge.target_action_id')
+        .innerJoin('automation_action_revisions as revision', 'revision.action_id', 'action.id')
+        .where('edge.source_action_id', sourceActionId)
+        .whereNull('action.deleted_at')
+        .where('revision.created_at', trx('automation_action_revisions').max('created_at').where('action_id', trx.ref('action.id')))
+        .orderBy('revision.created_at', 'desc')
+        .orderBy('revision.id', 'desc')
+        .first();
+    return row ?? null;
+}
+async function markStepTerminal(trx, step, status) {
+    const nowString = (0, date_1.toDatabaseDate)(new Date());
+    return await updateStep(trx, step, {
+        status,
+        finished_at: nowString,
+        updated_at: nowString,
+    });
+}
+async function retryStep(trx, step, retryAt) {
+    if (!(await isStepRunAutomationActive(trx, step.id))) {
+        await markStepTerminal(trx, step, 'automation disabled');
+        return false;
+    }
+    const nowString = (0, date_1.toDatabaseDate)(new Date());
+    return await updateStep(trx, step, {
+        status: 'pending',
+        started_at: null,
+        finished_at: null,
+        ready_at: (0, date_1.toDatabaseDate)(retryAt),
+        updated_at: nowString,
+    });
+}
+function getReadyAtForAction(action, now, fakeWaitHoursMultiplier) {
+    switch (action.type) {
+        case 'wait': {
+            const waitHours = requireValue({
+                ...action,
+                id: action.action_id,
+            }, 'wait_hours');
+            const waitMs = waitHours * (fakeWaitHoursMultiplier || HOUR_MS);
+            return new Date(now.getTime() + waitMs);
+        }
+        case 'send_email':
+            return now;
+        default: {
+            const _exhaustive = action.type;
+            throw new errors_1.default.IncorrectUsageError({
+                message: `Unexpected action type ${_exhaustive}`,
+            });
+        }
+    }
+}
+async function cancelCancelablePendingStepsForAutomation(trx, automationId, now) {
+    const nowString = (0, date_1.toDatabaseDate)(now);
+    const staleLockCutoff = (0, date_1.toDatabaseDate)((0, stale_lock_cutoff_1.getStaleLockCutoff)(now));
+    await trx('automation_run_steps')
+        .update({
+        status: 'automation disabled',
+        finished_at: nowString,
+        updated_at: nowString,
+        locked_by: null,
+        locked_at: null,
+    })
+        .where('status', 'pending')
+        .whereIn('automation_run_id', trx('automation_runs').select('id').where('automation_id', automationId))
+        .where((builder) => {
+        builder.whereNull('locked_by').orWhere('locked_at', '<', staleLockCutoff);
+    });
+}
+async function isStepRunAutomationActive(trx, stepId) {
+    const query = trx('automation_run_steps as step')
+        .select(trx.raw('1'))
+        .innerJoin('automation_runs as run', 'run.id', 'step.automation_run_id')
+        .innerJoin('automations as automation', 'automation.id', 'run.automation_id')
+        .where('step.id', stepId)
+        .where('automation.status', 'active');
+    return await selectExists(trx, query);
+}
+async function isRunAutomationActive(trx, automationRunId) {
+    const query = trx('automation_runs as run')
+        .select(trx.raw('1'))
+        .innerJoin('automations as automation', 'automation.id', 'run.automation_id')
+        .where('run.id', automationRunId)
+        .where('automation.status', 'active');
+    return await selectExists(trx, query);
+}
+async function selectExists(trx, query) {
+    const row = await trx
+        .select(trx.raw('exists ? as `exists`', [query]))
+        .first();
+    return Boolean(Number(row?.exists));
+}
+/**
+ * Update a step. Returns whether the update succeeded.
+ *
+ * Should only update locked steps to avoid race conditions. Imagine the following scenario:
+ *
+ * 1. A step is locked by Worker A.
+ * 2. The lock expires.
+ * 3. The step is locked by Worker B.
+ * 4. Worker A finishes its work.
+ *
+ * Worker A has lost its lock, so it shouldn't be updating the step any more.
+ */
+async function updateStep(trx, step, attrs) {
+    /* eslint-disable camelcase */
+    const { started_at, finished_at, ready_at } = attrs;
+    const changes = await trx('automation_run_steps')
+        .update({
+        status: attrs.status,
+        updated_at: attrs.updated_at,
+        locked_by: null,
+        locked_at: null,
+        ...(started_at === undefined ? {} : { started_at }),
+        ...(finished_at === undefined ? {} : { finished_at }),
+        ...(ready_at === undefined ? {} : { ready_at }),
+    })
+        .where('id', step.id)
+        .where('status', 'pending')
+        .where('locked_by', step.locked_by);
+    /* eslint-enable camelcase */
+    return changes >= 1;
+}
+async function loadAutomation(trx, automationId) {
+    const row = await trx('automations')
+        .select('id', 'slug', 'name', 'status', 'created_at', 'updated_at')
+        .where('id', automationId)
+        .first();
+    return row ?? null;
+}
+async function loadAutomationBySlug(trx, slug) {
+    const row = await trx('automations')
+        .select('id', 'slug', 'name', 'status', 'created_at', 'updated_at')
+        .where('slug', slug)
+        .first();
+    return row ?? null;
+}
+async function loadAutomations(trx) {
+    return await trx('automations')
+        .select('id', 'slug', 'name', 'status', 'created_at', 'updated_at')
+        .orderBy('name');
+}
+async function loadAutomationsWithStats(trx) {
+    const inProgressRuns = trx('automation_run_steps')
+        .distinct('automation_run_id')
+        .where('status', 'pending')
+        .as('in_progress_runs');
+    const runStats = trx('automation_runs')
+        .select('automation_runs.automation_id')
+        .max({ last_run_created_at: 'automation_runs.created_at' })
+        .count({ total_run_count: '*' })
+        .count({ in_progress_run_count: 'in_progress_runs.automation_run_id' })
+        .leftJoin(inProgressRuns, 'automation_runs.id', 'in_progress_runs.automation_run_id')
+        .groupBy('automation_runs.automation_id')
+        .as('run_stats');
+    return await trx('automations')
+        .select('automations.id', 'automations.slug', 'automations.name', 'automations.status', 'automations.created_at', 'automations.updated_at', 'run_stats.last_run_created_at', 'run_stats.total_run_count', 'run_stats.in_progress_run_count')
+        .leftJoin(runStats, 'automations.id', 'run_stats.automation_id')
+        .orderBy('automations.name');
+}
+async function updateAutomation(trx, automation) {
+    await trx('automations')
+        .update({
+        status: automation.status,
+        updated_at: automation.updated_at,
+    })
+        .where('id', automation.id);
+    return requireAutomation(await loadAutomation(trx, automation.id), automation.id);
+}
+async function replaceAutomationGraph(trx, automationId, submittedActions, edges) {
+    const existingActions = await loadAutomationActionRows(trx, automationId);
+    const existingActionById = new Map(existingActions.map((action) => [action.id, action]));
+    const actions = (await resolveEmailDesignSettingIds(trx, submittedActions)).map(formatActionOnWrite);
+    const submittedActionIds = new Set(actions.map((action) => action.id));
+    const actionIdsWithOwners = await loadActionIdsWithOwners(trx, [...submittedActionIds]);
+    const latestRevisionByActionId = new Map((await loadLatestActionRevisions(trx, [...submittedActionIds])).map((revision) => [
+        revision.action_id,
+        revision,
+    ]));
+    const now = (0, date_1.toDatabaseDate)(new Date());
+    const actionsToInsert = [];
+    const revisionsToInsert = [];
+    for (const action of actions) {
+        const existingAction = existingActionById.get(action.id);
+        if (existingAction) {
+            if (existingAction.type !== action.type) {
+                throw new errors_1.default.ValidationError({
+                    message: (0, tpl_1.default)(messages.conflictingAutomationActionType, {
+                        actionId: action.id,
+                    }),
+                    property: 'actions.type',
+                });
+            }
+        }
+        else {
+            if (actionIdsWithOwners.has(action.id)) {
+                throw new errors_1.default.ValidationError({
+                    message: (0, tpl_1.default)(messages.conflictingAutomationActionId, {
+                        actionId: action.id,
+                    }),
+                    property: 'actions.id',
+                });
+            }
+            actionsToInsert.push({
+                id: action.id,
+                created_at: now,
+                updated_at: now,
+                automation_id: automationId,
+                type: action.type,
+            });
+        }
+        const latestRevision = latestRevisionByActionId.get(action.id);
+        if (shouldInsertActionRevision(action, latestRevision)) {
+            revisionsToInsert.push({
+                actionId: action.id,
+                action,
+                createdAt: getNextRevisionCreatedAt(latestRevision?.created_at ?? null, now),
+            });
+        }
+    }
+    await insertActions(trx, actionsToInsert);
+    await insertActionRevisions(trx, revisionsToInsert);
+    const actionIdsToSoftDelete = existingActions
+        .filter((existingAction) => !submittedActionIds.has(existingAction.id))
+        .map((existingAction) => existingAction.id);
+    await softDeleteActions(trx, actionIdsToSoftDelete, now);
+    await deleteAutomationEdges(trx, automationId);
+    await insertActionEdges(trx, edges);
+}
+function formatActionOnWrite(action) {
+    if (action.type !== 'send_email') {
+        return action;
+    }
+    return {
+        ...action,
+        data: {
+            ...action.data,
+            email_lexical: url_utils_1.default.lexicalToTransformReady(action.data.email_lexical, {
+                nodes: lexical_1.default.nodes,
+                transformMap: lexical_1.default.urlTransformMap,
+            }),
+        },
+    };
+}
+async function resolveEmailDesignSettingIds(trx, actions) {
+    if (!actions.some((action) => action.type === 'send_email' &&
+        action.data.email_design_setting_id === DEFAULT_EMAIL_DESIGN_SETTING_REFERENCE)) {
+        return [...actions];
+    }
+    const defaultEmailDesignSettingId = await loadDefaultEmailDesignSettingId(trx);
+    return actions.map((action) => {
+        if (action.type !== 'send_email' ||
+            action.data.email_design_setting_id !== DEFAULT_EMAIL_DESIGN_SETTING_REFERENCE) {
+            return action;
+        }
+        return {
+            ...action,
+            data: {
+                ...action.data,
+                email_design_setting_id: defaultEmailDesignSettingId,
+            },
+        };
+    });
+}
+async function loadDefaultEmailDesignSettingId(trx) {
+    const row = await trx('email_design_settings')
+        .select('id')
+        .where('slug', constants_1.DEFAULT_EMAIL_DESIGN_SETTING_SLUG)
+        .first();
+    if (!row?.id) {
+        throw new errors_1.default.InternalServerError({
+            message: (0, tpl_1.default)(messages.defaultEmailDesignSettingNotFound),
+        });
+    }
+    return row.id;
+}
+async function loadAutomationActionRows(trx, automationId) {
+    return await trx('automation_actions')
+        .select('id', 'type')
+        .where('automation_id', automationId)
+        .whereNull('deleted_at');
+}
+async function loadActionIdsWithOwners(trx, actionIds) {
+    if (actionIds.length === 0) {
+        return new Set();
+    }
+    const rows = await trx('automation_actions').select('id').whereIn('id', actionIds);
+    return new Set(rows.map((row) => row.id));
+}
+async function insertActions(trx, actions) {
+    if (actions.length === 0) {
+        return;
+    }
+    await trx('automation_actions').insert(actions);
+}
+function shouldInsertActionRevision(action, latestRevision) {
+    if (!latestRevision) {
+        return true;
+    }
+    return !(0, dequal_1.dequal)(buildRevisionActionData(action, latestRevision), action.data);
+}
+function buildRevisionActionData(action, revision) {
+    switch (action.type) {
+        case 'wait':
+            return {
+                wait_hours: revision.wait_hours,
+            };
+        case 'send_email':
+            return {
+                email_subject: revision.email_subject,
+                email_lexical: revision.email_lexical,
+                email_design_setting_id: revision.email_design_setting_id,
+            };
+        default: {
+            const _exhaustive = action;
+            throw new errors_1.default.InternalServerError({
+                message: `Unhandled action type: ${_exhaustive}`,
+            });
+        }
+    }
+}
+async function loadLatestActionRevisions(trx, actionIds) {
+    if (actionIds.length === 0) {
+        return [];
+    }
+    const latestRevisionDates = trx('automation_action_revisions')
+        .select('action_id')
+        .max({ created_at: 'created_at' })
+        .whereIn('action_id', actionIds)
+        .groupBy('action_id')
+        .as('latest_revision_dates');
+    return await trx('automation_action_revisions')
+        .select('automation_action_revisions.action_id', 'automation_action_revisions.created_at', 'automation_action_revisions.wait_hours', 'automation_action_revisions.email_subject', 'automation_action_revisions.email_lexical', 'automation_action_revisions.email_design_setting_id')
+        .innerJoin(latestRevisionDates, function () {
+        this.on('automation_action_revisions.action_id', 'latest_revision_dates.action_id').andOn('automation_action_revisions.created_at', 'latest_revision_dates.created_at');
+    });
+}
+async function softDeleteActions(trx, actionIds, deletedAt) {
+    if (actionIds.length === 0) {
+        return;
+    }
+    await trx('automation_actions')
+        .update({
+        deleted_at: deletedAt,
+        updated_at: deletedAt,
+    })
+        .whereIn('id', actionIds);
+}
+async function insertActionRevisions(trx, revisions) {
+    if (revisions.length === 0) {
+        return;
+    }
+    await trx('automation_action_revisions').insert(revisions.map(({ actionId, action, createdAt }) => buildActionRevision(actionId, action, createdAt)));
+}
+function getNextRevisionCreatedAt(latestCreatedAt, requestedCreatedAt) {
+    if (!latestCreatedAt) {
+        return (0, date_1.toDatabaseDate)(requestedCreatedAt);
+    }
+    const requestedTime = (0, date_1.fromDatabaseDate)(requestedCreatedAt).getTime();
+    const latestTime = (0, date_1.fromDatabaseDate)(latestCreatedAt).getTime();
+    if (requestedTime > latestTime) {
+        return (0, date_1.toDatabaseDate)(requestedCreatedAt);
+    }
+    return (0, date_1.toDatabaseDate)(new Date(latestTime + 1000));
+}
+function buildActionRevision(actionId, action, createdAt) {
+    switch (action.type) {
+        case 'wait':
+            return {
+                id: (0, bson_objectid_1.default)().toString(),
+                created_at: createdAt,
+                action_id: actionId,
+                wait_hours: action.data.wait_hours,
+                email_subject: null,
+                email_lexical: null,
+                email_design_setting_id: null,
+            };
+        case 'send_email':
+            return {
+                id: (0, bson_objectid_1.default)().toString(),
+                created_at: createdAt,
+                action_id: actionId,
+                wait_hours: null,
+                email_subject: action.data.email_subject,
+                email_lexical: action.data.email_lexical,
+                email_design_setting_id: action.data.email_design_setting_id,
+            };
+        default: {
+            const _exhaustive = action;
+            throw new errors_1.default.InternalServerError({
+                message: `Unexpected action type ${_exhaustive}`,
+            });
+        }
+    }
+}
+async function deleteAutomationEdges(trx, automationId) {
+    await trx('automation_action_edges')
+        .delete()
+        .whereIn('source_action_id', trx('automation_actions').select('id').where('automation_id', automationId));
+}
+async function insertActionEdges(trx, edges) {
+    if (edges.length === 0) {
+        return;
+    }
+    await trx('automation_action_edges').insert(edges.map((edge) => ({
+        source_action_id: edge.source_action_id,
+        target_action_id: edge.target_action_id,
+    })));
+}
+function requireAutomation(automation, id) {
+    if (!automation) {
+        throw new errors_1.default.InternalServerError({
+            message: `Updated automation "${id}" could not be loaded.`,
+        });
+    }
+    return automation;
+}
+async function buildAutomation(trx, automation) {
+    const actionRows = await loadActionRows(trx, automation.id);
+    const actionStats = await loadActionStats(trx, actionRows.map((row) => row.id));
+    const edgeRows = await loadEdgeRows(trx, automation.id);
+    return {
+        ...buildAutomationSummary(automation),
+        actions: actionRows.map((row) => buildActionPayload(row, actionStats.get(row.id) ?? null)),
+        edges: edgeRows.map((row) => buildEdgePayload(row)),
+    };
+}
+function buildAutomationSummary(automation) {
+    return {
+        id: automation.id,
+        slug: automation.slug,
+        name: automation.name,
+        status: automation.status,
+        created_at: serializeDate(automation.created_at),
+        updated_at: serializeDate(automation.updated_at),
+    };
+}
+function buildAutomationBrowseResult(automation) {
+    return {
+        ...buildAutomationSummary(automation),
+        stats: {
+            last_run_created_at: automation.last_run_created_at
+                ? (0, date_1.fromDatabaseDate)(automation.last_run_created_at)
+                : null,
+            total_run_count: Number(automation.total_run_count ?? 0),
+            in_progress_run_count: Number(automation.in_progress_run_count ?? 0),
+        },
+    };
+}
+function serializeDate(date) {
+    const normalizedDate = (0, date_1.fromDatabaseDate)(date);
+    normalizedDate.setMilliseconds(0);
+    return normalizedDate.toISOString();
+}
+async function loadActionRows(trx, automationId) {
+    return await trx('automation_actions as a')
+        .select('a.id as id', 'a.type as type', 'r.wait_hours as wait_hours', 'r.email_subject as email_subject', 'r.email_lexical as email_lexical', 'r.email_design_setting_id as email_design_setting_id')
+        .innerJoin('automation_action_revisions as r', 'r.action_id', 'a.id')
+        .where('a.automation_id', automationId)
+        .whereNull('a.deleted_at')
+        .where('r.created_at', trx('automation_action_revisions').max('created_at').where('action_id', trx.ref('a.id')))
+        .orderBy(['a.created_at', 'a.id']);
+}
+async function loadActionStats(trx, actionIds) {
+    if (actionIds.length === 0) {
+        return new Map();
+    }
+    const rows = await trx('automation_action_revisions')
+        .select('action_id')
+        .sum({
+        email_clicked_count: 'email_clicked_count',
+        email_sent_count: 'email_sent_count',
+        email_opened_count: 'email_opened_count',
+    })
+        .whereIn('action_id', actionIds)
+        .groupBy('action_id');
+    return new Map(rows.map((row) => [row.action_id, buildEmailStats(row)]));
+}
+async function loadEdgeRows(trx, automationId) {
+    return await trx('automation_action_edges as e')
+        .select('e.source_action_id', 'e.target_action_id')
+        .innerJoin('automation_actions as source_action', (join) => {
+        join.on('source_action.id', 'e.source_action_id').onNull('source_action.deleted_at');
+    })
+        .innerJoin('automation_actions as target_action', (join) => {
+        join
+            .on('target_action.id', 'e.target_action_id')
+            .onNull('target_action.deleted_at')
+            .on('target_action.automation_id', 'source_action.automation_id');
+    })
+        .where('source_action.automation_id', automationId)
+        .orderBy(['e.source_action_id', 'e.target_action_id']);
+}
+function buildActionPayload(row, stats) {
+    switch (row.type) {
+        case 'wait':
+            return {
+                id: row.id,
+                type: 'wait',
+                data: {
+                    wait_hours: requireValue(row, 'wait_hours'),
+                },
+            };
+        case 'send_email':
+            return {
+                id: row.id,
+                type: 'send_email',
+                data: {
+                    email_subject: requireValue(row, 'email_subject'),
+                    email_lexical: url_utils_1.default.transformReadyToAbsolute(requireValue(row, 'email_lexical')),
+                    email_design_setting_id: requireValue(row, 'email_design_setting_id'),
+                },
+                stats: stats ?? EMPTY_EMAIL_STATS,
+            };
+    }
+}
+const EMPTY_EMAIL_STATS = {
+    email_clicked_count: 0,
+    email_sent_count: 0,
+    email_opened_count: 0,
+    opened_rate: null,
+    clicked_rate: null,
+};
+function buildEmailStats(row) {
+    const emailClickedCount = row.email_clicked_count ?? 0;
+    const emailSentCount = row.email_sent_count ?? 0;
+    const emailOpenedCount = row.email_opened_count ?? 0;
+    return {
+        email_clicked_count: emailClickedCount,
+        email_sent_count: emailSentCount,
+        email_opened_count: emailOpenedCount,
+        opened_rate: emailSentCount ? Math.round((emailOpenedCount / emailSentCount) * 100) : null,
+        clicked_rate: emailSentCount ? Math.round((emailClickedCount / emailSentCount) * 100) : null,
+    };
+}
+function requireValue(row, field) {
+    const value = row[field];
+    if (value === null || value === undefined) {
+        throw new errors_1.default.InternalServerError({
+            message: (0, tpl_1.default)(messages.invalidAutomationActionRevision, {
+                actionId: row.id,
+                actionType: row.type,
+                field,
+            }),
+        });
+    }
+    return value;
+}
+function buildEdgePayload(edge) {
+    return {
+        source_action_id: edge.source_action_id,
+        target_action_id: edge.target_action_id,
+    };
+}
+function buildPagination(total) {
+    return {
+        page: 1,
+        pages: 1,
+        limit: 'all',
+        total,
+        prev: null,
+        next: null,
+    };
+}

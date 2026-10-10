@@ -1,0 +1,54 @@
+<div class="gh-flow">
+    <div class="gh-flow-content-wrap">
+        <section class="gh-flow-content">
+            {{#if this.requestSent}}
+                <header>
+                    <div class="gh-site-icon" style={{site-icon-style}}></div>
+                    <h1>Check your email.</h1>
+                    <p>If the address can register, Reedito will send a secure link to finish creating your creator account.</p>
+                </header>
+            {{else}}
+                <header>
+                    <div class="gh-site-icon" style={{site-icon-style}}></div>
+                    <h1>Create a creator account.</h1>
+                    <p>Join {{this.config.blogTitle}} and start drafting articles. New creator accounts can submit drafts for review.</p>
+                </header>
+
+                <form id="creator-signup" method="post" action="javascript:void(0)" class="gh-signin" novalidate="novalidate" {{on "submit" this.submit}}>
+                    <div class="form-group">
+                        <label for="creator-email">Email address</label>
+                        <span class="gh-input-icon gh-icon-mail">
+                            <input
+                                id="creator-email"
+                                type="email"
+                                class="gh-input email"
+                                placeholder="you@example.com"
+                                name="email"
+                                autocomplete="email"
+                                required
+                                value={{this.email}}
+                                {{on "input" this.setEmail}}
+                                data-test-input="creator-email"
+                            />
+                        </span>
+                    </div>
+
+                    <GhTaskButton
+                        @buttonText="Send account setup link &rarr;"
+                        @runningText="Sending"
+                        @task={{this.requestSignupTask}}
+                        @showSuccess={{false}}
+                        @useAccentColor={{true}}
+                        @type="submit"
+                        class="gh-btn gh-btn-login gh-btn-block gh-btn-icon"
+                        data-test-button="creator-signup" />
+                </form>
+                {{#if this.flowErrors}}
+                    <p class="main-error" data-test-creator-signup-error>{{this.flowErrors}}&nbsp;</p>
+                {{/if}}
+            {{/if}}
+
+            <p class="main-notification">Already have an account? <LinkTo @route="signin">Sign in</LinkTo></p>
+        </section>
+    </div>
+</div>

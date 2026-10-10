@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f7f6f2">
+    <title>{{pageTitle}} | Reedito</title>
+    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body {
+        display: grid;
+        min-height: 100vh;
+        margin: 0;
+        padding: 24px;
+        place-items: center;
+        background: #f7f6f2;
+        color: #19352d;
+        font: 16px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .error-card {
+        width: min(100%, 620px);
+        padding: clamp(28px, 7vw, 64px);
+        border: 1px solid #e5e4dc;
+        border-radius: 24px;
+        background: #fff;
+        box-shadow: 0 20px 60px rgb(25 53 45 / 7%);
+      }
+      .error-brand {
+        color: #477463;
+        font-size: 14px;
+        font-weight: 750;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+      }
+      .error-code {
+        margin: 36px 0 8px;
+        color: #70877e;
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: .16em;
+      }
+      .error-heading {
+        margin: 0;
+        font-size: clamp(30px, 6vw, 48px);
+        line-height: 1.12;
+        letter-spacing: -.04em;
+      }
+      .error-description {
+        margin: 18px 0 30px;
+        color: #52665e;
+      }
+      .error-link {
+        display: inline-flex;
+        min-height: 48px;
+        align-items: center;
+        padding: 0 20px;
+        border-radius: 999px;
+        background: #19352d;
+        color: #fff;
+        font-weight: 650;
+        text-decoration: none;
+      }
+      .error-link:focus-visible {
+        outline: 3px solid #4a8b70;
+        outline-offset: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="error-card" aria-labelledby="error-heading">
+      <div class="error-brand">Reedito</div>
+      <p class="error-code">{{statusCode}} · REEDITO</p>
+      <h1 class="error-heading" id="error-heading">{{headline}}</h1>
+      <p class="error-description">{{description}}</p>
+      <a class="error-link" href="{{homeUrl}}">Go to Reedito home</a>
+    </main>
+  </body>
+</html>

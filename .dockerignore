@@ -1,0 +1,46 @@
+# Avoid negated patterns. They prevent BuildKit from pruning ignored directories
+# during wildcard COPY context discovery, causing severe build slowdowns.
+
+node_modules
+
+.env
+.env.*
+secrets
+secrets/**
+
+.nxcache
+.nx
+
+**/*.log
+
+build
+dist
+
+coverage
+
+.eslintcache
+
+test-results
+
+tsconfig.tsbuildinfo
+
+Dockerfile
+.dockerignore
+
+.git
+.vscode
+.editorconfig
+compose.yml
+
+.agents
+.claude
+.codex
+.cursor
+
+# NOTE: core/built/admin is intentionally NOT ignored — the production image's
+# `full` stage COPYs it from the build context, where CI injects the admin build
+# artifact. The `core` stage copies from the deploy stage (which never builds
+# admin), so a stray local admin build cannot leak into the core image.
+
+# Ignore local config files (.json and .jsonc)
+reedito/core/config.local.json*

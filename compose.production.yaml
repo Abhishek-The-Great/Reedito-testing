@@ -1,0 +1,169 @@
+name: reedito-production
+
+services:
+  mysql:
+    image: mysql:8.4.11@sha256:85b9bf2e29cf836ecb8c2a15a935d4ba0c606631dff1dd79531a11983c638f2a
+    restart: unless-stopped
+    command: ['--default-time-zone=+00:00']
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env.production}
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env.production}
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_app_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+    secrets:
+      - mysql_app_password
+      - mysql_root_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping --protocol=TCP -h 127.0.0.1 -uroot --password="$$(cat /run/secrets/mysql_root_password)" --silent
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging: &rotated_logs
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    networks:
+      - reedito_internal
+
+  reedito:
+    image: ${REEDITO_IMAGE:-reedito:production}
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+      target: full
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      url: ${REEDITO_URL:-https://reedito.com}
+      server__host: 0.0.0.0
+      server__port: '2368'
+      database__client: mysql
+      database__connection__host: mysql
+      database__connection__port: '3306'
+      database__connection__user: ${MYSQL_USER:-reedito}
+      database__connection__password_FILE: /run/secrets/mysql_app_password
+      database__connection__database: ${MYSQL_DATABASE:-reedito}
+      paths__contentPath: /home/reedito/content
+      mail__from: ${MAIL_FROM:?Set MAIL_FROM in .env.production}
+      mail__transport: SMTP
+      mail__options__host: smtp.resend.com
+      mail__options__port: '587'
+      mail__options__secure: 'false'
+      mail__options__auth__user: resend
+      mail__options__auth__pass_FILE: /run/secrets/resend_smtp_password
+      bulkEmail__mailgun__apiKey_FILE: /run/secrets/mailgun_api_key
+      bulkEmail__mailgun__domain: ${MAILGUN_DOMAIN:?Set MAILGUN_DOMAIN in .env.production}
+      bulkEmail__mailgun__baseUrl: ${MAILGUN_BASE_URL:-https://api.mailgun.net/v3}
+      sentry__dsn: ${SENTRY_SERVER_DSN:-}
+      client_sentry__dsn: ${SENTRY_CLIENT_DSN:-}
+      portal__url: /reedito/assets/portal/portal.min.js
+      comments__url: /reedito/assets/comments-ui/comments-ui.min.js
+      sodoSearch__url: /reedito/assets/sodo-search/sodo-search.min.js
+      sodoSearch__styles: /reedito/assets/sodo-search/main.css
+      signupForm__url: /reedito/assets/signup-form/signup-form.min.js
+      announcementBar__url: /reedito/assets/announcement-bar/announcement-bar.min.js
+      adminToolbar__url: /reedito/assets/admin-toolbar/admin-toolbar.min.js
+    secrets:
+      - mysql_app_password
+      - resend_smtp_password
+      - mailgun_api_key
+    volumes:
+      - reedito_content:/home/reedito/content
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:2368/').then((r) => process.exit(r.status < 500 ? 0: 1)).catch(() => process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    logging: *rotated_logs
+    networks:
+      - reedito_internal
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      reedito:
+        condition: service_started
+    environment:
+      REEDITO_DOMAIN: ${REEDITO_DOMAIN:-reedito.com}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/caddy/unavailable.html:/srv/fallback/unavailable.html:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *rotated_logs
+    networks:
+      - reedito_internal
+
+  backup:
+    profiles: [backup]
+    build:
+      context: .
+      dockerfile: deploy/backup.Dockerfile
+    image: reedito-backup:production
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-reedito}
+      MYSQL_USER: ${MYSQL_USER:-reedito}
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_app_password
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:?Set R2_ACCOUNT_ID in .env.production}
+      R2_BUCKET: ${R2_BUCKET:?Set R2_BUCKET in .env.production}
+      AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID in .env.production}
+      AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY in .env.production}
+      RESTIC_REPOSITORY: s3:https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${R2_BUCKET}/reedito
+      RESTIC_PASSWORD_FILE: /run/secrets/restic_password
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+    secrets:
+      - mysql_app_password
+      - restic_password
+    volumes:
+      - reedito_content:/backup/content:ro
+    logging: *rotated_logs
+    networks:
+      - reedito_internal
+
+secrets:
+  mysql_root_password:
+    file: ./secrets/mysql_root_password
+  mysql_app_password:
+    file: ./secrets/mysql_app_password
+  resend_smtp_password:
+    file: ./secrets/resend_smtp_password
+  mailgun_api_key:
+    file: ./secrets/mailgun_api_key
+  restic_password:
+    file: ./secrets/restic_password
+
+volumes:
+  mysql_data:
+  reedito_content:
+  caddy_data:
+  caddy_config:
+
+networks:
+  reedito_internal:
+    driver: bridge

@@ -1,0 +1,41 @@
+import React from 'react';
+import { Button } from '@reedito/shade/components';
+import { LucideIcon, cn } from '@reedito/shade/utils';
+import { useNavigateWithBasePath } from '@src/hooks/use-navigate-with-base-path';
+import { useNavigationStack } from '@reedito/admin-x-framework';
+
+interface BackButtonProps {
+  className?: string;
+  onClick?: () => void;
+}
+
+const BackButton: React.FC<BackButtonProps> = ({ className, onClick }) => {
+  const navigate = useNavigateWithBasePath();
+  const { previousPath } = useNavigationStack();
+
+  return (
+    <Button
+      className={cn(
+        'size-8 rounded-full bg-white/85 px-2 backdrop-blur-md focus-visible:ring-0 dark:bg-transparent dark:text-white [&_svg]:size-6',
+        className,
+      )}
+      variant="ghost"
+      onClick={() => {
+        if (onClick) {
+          onClick();
+          return;
+        }
+
+        if (previousPath) {
+          navigate(-1);
+        } else {
+          navigate('/');
+        }
+      }}
+    >
+      <LucideIcon.ArrowLeft size={20} strokeWidth={1.25} />
+    </Button>
+  );
+};
+
+export default BackButton;

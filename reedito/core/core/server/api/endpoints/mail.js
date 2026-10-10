@@ -1,0 +1,57 @@
+const tpl = require('@tryghost/tpl');
+const mailService = require('../../services/mail');
+const api = require('./');
+let mailer;
+const _private = {};
+
+const messages = {
+  unableToSendEmail: 'Reedito is currently unable to send email.',
+  seeLinkForInstructions: 'See {link} for instructions.',
+  testReeditoEmail: 'Test Reedito Email',
+};
+
+_private.sendMail = (object) => {
+  if (!(mailer instanceof mailService.ReeditoMailer)) {
+    mailer = new mailService.ReeditoMailer();
+  }
+
+  return mailer.send(object.mail[0].message).catch((err) => {
+    if (mailer.state.usingDirect) {
+      api.notifications.add(
+        {
+          notifications: [
+            {
+              type: 'warn',
+              message: [
+                tpl(messages.unableToSendEmail),
+                tpl(messages.seeLinkForInstructions, {
+                  link: 'https://docs.ghost.org/concepts/config/#mail',
+                }),
+              ].join(' '),
+            },
+          ],
+        },
+        { context: { internal: true } },
+      );
+    }
+
+    return Promise.reject(err);
+  });
+};
+
+/** @type {import('@reedito/api-framework').Controller} */
+const controller = {
+  docName: 'mail',
+
+  send: {
+    headers: {
+      cacheInvalidate: false,
+    },
+    permissions: true,
+    query(frame) {
+      return _private.sendMail(frame.data);
+    },
+  },
+};
+
+module.exports = controller;

@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Reedito: Backend (nodemon)",
+      "type": "shell",
+      "command": "pnpm --filter reedito dev",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "group": "dev" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reedito: Frontend dev servers",
+      "type": "shell",
+      "command": "pnpm nx run-many -t dev --projects=@reedito/admin,@reedito/portal,@reedito/comments-ui,@reedito/signup-form,@reedito/sodo-search,@reedito/announcement-bar",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "group": "dev" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reedito: Full dev stack",
+      "dependsOn": ["Reedito: Backend (nodemon)", "Reedito: Frontend dev servers"],
+      "dependsOrder": "parallel",
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Reedito: Reset data (empty)",
+      "type": "shell",
+      "command": "node index.js generate-data --clear-database --quantities members:0,posts:0 --seed 123",
+      "options": { "cwd": "${workspaceFolder}/reedito/core" },
+      "problemMatcher": []
+    }
+  ]
+}

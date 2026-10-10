@@ -1,0 +1,33 @@
+import Model, {attr, belongsTo} from '@ember-data/model';
+import {inject as service} from '@ember/service';
+
+export default Model.extend({
+    token: attr('string'),
+    email: attr('string'),
+    expires: attr('number'),
+    createdAtUTC: attr('moment-utc'),
+    updatedAtUTC: attr('moment-utc'),
+    status: attr('string'),
+
+    role: belongsTo('role', {async: false}),
+
+    ajax: service(),
+    reeditoPaths: service(),
+
+    resend() {
+        const inviteData = {
+            email: this.email,
+            role_id: this.role.id
+        };
+
+        const inviteUrl = this.get('reeditoPaths.url').api('invites');
+
+        return this.ajax.del(`${inviteUrl}${this.id}`)
+            .then(() => {
+                return this.ajax.post(inviteUrl, {
+                    data: JSON.stringify({invites: [inviteData]}),
+                    contentType: 'application/json'
+                });
+            });
+    }
+});
