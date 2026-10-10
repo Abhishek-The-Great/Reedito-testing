@@ -15,14 +15,6 @@ services:
       - mysql_root_password
     volumes:
       - mysql_data:/var/lib/mysql
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - mysqladmin ping --protocol=TCP -h 127.0.0.1 -uroot --password="$$(cat /run/secrets/mysql_root_password)" --silent
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 40s
     logging: &rotated_logs
       driver: json-file
       options:
@@ -41,8 +33,7 @@ services:
     init: true
     stop_grace_period: 60s
     depends_on:
-      mysql:
-        condition: service_healthy
+      - mysql
     environment:
       NODE_ENV: production
       url: ${REEDITO_URL:-https://reedito.com}
@@ -80,16 +71,6 @@ services:
       - mailgun_api_key
     volumes:
       - reedito_content:/home/reedito/content
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:2368/').then((r) => process.exit(r.status < 500 ? 0: 1)).catch(() => process.exit(1))
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 90s
     logging: *rotated_logs
     networks:
       - reedito_internal
@@ -103,6 +84,7 @@ services:
     environment:
       REEDITO_DOMAIN: ${REEDITO_DOMAIN:-reedito.com}
     ports:
+      - '8080:80'
       - '80:80'
       - '443:443'
       - '443:443/udp'
@@ -123,8 +105,7 @@ services:
     image: reedito-backup:production
     restart: unless-stopped
     depends_on:
-      mysql:
-        condition: service_healthy
+      - mysql
     environment:
       MYSQL_HOST: mysql
       MYSQL_DATABASE: ${MYSQL_DATABASE:-reedito}

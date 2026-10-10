@@ -1,0 +1,6 @@
+:80 {
+	encode zstd gzip
+	reverse_proxy reedito:2368 {
+		header_up X-Forwarded-Proto https
+	}
+}
